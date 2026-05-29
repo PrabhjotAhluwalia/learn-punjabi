@@ -214,17 +214,45 @@ const Speech = {
   unsupported: false,
   noVoiceWarned: false,
   warnCb: null,
+  isSafari: false,
+  isChrome: false,
+  isBrave: false,
+  primed: false,
+  spoke: false,
   init(){
     if(!('speechSynthesis' in window)){ Speech.unsupported = true; return; }
+    const ua = navigator.userAgent || '';
+    Speech.isChrome = /Chrome|CriOS|Edg/i.test(ua);
+    Speech.isSafari = /Safari/i.test(ua) && !Speech.isChrome;
+    // Brave reports itself as Chrome but blocks the Web Speech API via Shields.
+    try{
+      if(navigator.brave && typeof navigator.brave.isBrave === 'function'){
+        navigator.brave.isBrave().then(function(r){ Speech.isBrave = !!r; });
+      }
+    }catch(e){}
     const load = ()=>{ try{ Speech.voices = window.speechSynthesis.getVoices()||[]; }catch(e){ Speech.voices=[]; } Speech.ready = true; };
     load();
     // voices frequently load async — listen and also poll a few times
     try{ window.speechSynthesis.onvoiceschanged = load; }catch(e){}
     let tries = 0;
-    const poll = setInterval(()=>{ load(); if(Speech.voices.length || ++tries > 12) clearInterval(poll); }, 250);
-    // Chrome bug: synth pauses when tab idle. Keep it alive.
+    const poll = setInterval(()=>{ load(); if(Speech.voices.length || ++tries > 16) clearInterval(poll); }, 250);
+    // Chrome ONLY bug: synth pauses when tab idle. Keep it alive.
+    // NOTE: pause()/resume() SILENCES Safari, so never run it there.
+    if(Speech.isChrome){
+      try{
+        setInterval(()=>{ if(window.speechSynthesis && window.speechSynthesis.speaking){ window.speechSynthesis.pause(); window.speechSynthesis.resume(); } }, 9000);
+      }catch(e){}
+    }
+  },
+  // Safari swallows the first utterance unless the engine is primed inside a user gesture.
+  prime(){
+    if(Speech.primed || Speech.unsupported) return;
+    Speech.primed = true;
     try{
-      setInterval(()=>{ if(window.speechSynthesis && window.speechSynthesis.speaking){ window.speechSynthesis.pause(); window.speechSynthesis.resume(); } }, 9000);
+      const u = new SpeechSynthesisUtterance('');
+      u.volume = 0;
+      window.speechSynthesis.speak(u);
+      window.speechSynthesis.cancel();
     }catch(e){}
   },
   pick(){
@@ -249,31 +277,52 @@ const Speech = {
     }
     if(!text){ opts.onend && opts.onend(); return; }
     try{
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
+      Speech.spoke = false;
       const v = Speech.pick();
-      if(v){ u.voice = v; u.lang = v.lang || 'hi-IN'; }
-      else {
-        // No voice object available yet — set a broad Indic lang and hope the OS routes it.
-        u.lang = 'hi-IN';
-        // If, after voices are known, there are simply none usable, warn once.
-        if(Speech.ready && (!Speech.voices || Speech.voices.length===0) && Speech.warnCb && !Speech.noVoiceWarned){
-          Speech.noVoiceWarned = true;
-          Speech.warnCb('No speech voice found on this device. On phones, install a Hindi/Punjabi voice in Settings → Accessibility → Text-to-Speech.');
-        }
+      // Brave blocks speech synthesis via its fingerprinting shield.
+      if(Speech.isBrave && Speech.warnCb && !Speech.noVoiceWarned){
+        Speech.noVoiceWarned = true;
+        Speech.warnCb('Brave blocks audio by default. Click the Brave Shields icon (lion) in the address bar → set "Block fingerprinting" to Allow (Standard) for this site, then reload. Or open the app in Chrome/Edge/Safari.');
+      } else if(!v && Speech.ready && (!Speech.voices || Speech.voices.length===0) && Speech.warnCb && !Speech.noVoiceWarned){
+        // Warn once if there are genuinely no usable voices.
+        Speech.noVoiceWarned = true;
+        Speech.warnCb('No speech voice found on this device. Try Chrome, or install a Hindi/Punjabi voice in your system settings.');
       }
-      u.rate = (opts.rate != null) ? opts.rate : 0.82;
-      u.pitch = (opts.pitch != null) ? opts.pitch : 1.0;
-      u.volume = 1;
       let done = false;
       const finish = ()=>{ if(done) return; done = true; opts.onend && opts.onend(); };
-      u.onend = finish;
-      u.onerror = finish;
-      window.speechSynthesis.speak(u);
-      // Chrome sometimes needs a nudge to actually start.
-      try{ window.speechSynthesis.resume(); }catch(e){}
-      // Safety: clear the "speaking" UI even if no end event ever fires.
-      setTimeout(finish, Math.max(2500, text.length * 220));
+      const build = ()=>{
+        const u = new SpeechSynthesisUtterance(text);
+        if(v){
+          u.voice = v;
+          // Safari mutes when u.lang conflicts with u.voice.lang — keep them identical.
+          if(v.lang) u.lang = v.lang;
+        } else {
+          u.lang = 'hi-IN';
+        }
+        u.rate = (opts.rate != null) ? opts.rate : 0.82;
+        u.pitch = (opts.pitch != null) ? opts.pitch : 1.0;
+        u.volume = 1;
+        u.onstart = ()=>{ Speech.spoke = true; };
+        u.onend = finish;
+        u.onerror = finish;
+        window.speechSynthesis.speak(u);
+        // Chrome (not Safari) sometimes needs a resume nudge.
+        if(Speech.isChrome){ try{ window.speechSynthesis.resume(); }catch(e){} }
+        // Detect silent failure (Brave/blocked): no onstart fired & nothing speaking.
+        setTimeout(()=>{
+          if(!Speech.spoke && !window.speechSynthesis.speaking && Speech.warnCb && !Speech.noVoiceWarned){
+            Speech.noVoiceWarned = true;
+            Speech.warnCb('Audio appears to be blocked by your browser. If you use Brave, click the Shields (lion) icon → allow fingerprinting for this site, then reload. Otherwise try Chrome, Edge or Safari.');
+          }
+        }, 700);
+        // Safety: clear the "speaking" UI even if no end event fires.
+        setTimeout(finish, Math.max(2500, text.length * 220));
+      };
+      // Cancel any current speech, then speak. Safari needs a microtask gap
+      // between cancel() and speak() or the new utterance is silently dropped.
+      window.speechSynthesis.cancel();
+      if(Speech.isSafari){ setTimeout(build, 60); }
+      else { build(); }
     }catch(e){ opts.onend && opts.onend(); }
   },
   stop(){ try{ window.speechSynthesis.cancel(); }catch(e){} }
@@ -306,6 +355,7 @@ function Speak({text, label, sm, rate}){
   const [on,setOn]=useState(false);
   const go=(e)=>{
     e&&e.stopPropagation();
+    Speech.prime();
     if(on){ Speech.stop(); setOn(false); return; }
     setOn(true);
     Speech.speak(text,{rate, onend:()=>setOn(false)});

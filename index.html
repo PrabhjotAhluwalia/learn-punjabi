@@ -211,34 +211,70 @@ const AP    = (M && M.AnimatePresence) ? M.AnimatePresence : ({children})=>child
 const Speech = {
   voices: [],
   ready: false,
+  unsupported: false,
+  noVoiceWarned: false,
+  warnCb: null,
   init(){
-    if(!('speechSynthesis' in window)) return;
-    const load = ()=>{ Speech.voices = window.speechSynthesis.getVoices()||[]; Speech.ready=true; };
+    if(!('speechSynthesis' in window)){ Speech.unsupported = true; return; }
+    const load = ()=>{ try{ Speech.voices = window.speechSynthesis.getVoices()||[]; }catch(e){ Speech.voices=[]; } Speech.ready = true; };
     load();
-    window.speechSynthesis.onvoiceschanged = load;
+    // voices frequently load async — listen and also poll a few times
+    try{ window.speechSynthesis.onvoiceschanged = load; }catch(e){}
+    let tries = 0;
+    const poll = setInterval(()=>{ load(); if(Speech.voices.length || ++tries > 12) clearInterval(poll); }, 250);
+    // Chrome bug: synth pauses when tab idle. Keep it alive.
+    try{
+      setInterval(()=>{ if(window.speechSynthesis && window.speechSynthesis.speaking){ window.speechSynthesis.pause(); window.speechSynthesis.resume(); } }, 9000);
+    }catch(e){}
   },
   pick(){
-    const vs = Speech.voices.length ? Speech.voices : (window.speechSynthesis ? window.speechSynthesis.getVoices() : []);
-    // Prefer Punjabi, then Hindi (closest available), then any Indian English
-    return vs.find(v=>/pa[-_]?IN|punjab/i.test(v.lang+v.name))
-        || vs.find(v=>/^pa/i.test(v.lang))
-        || vs.find(v=>/hi[-_]?IN/i.test(v.lang))
-        || vs.find(v=>/^hi/i.test(v.lang))
-        || vs.find(v=>/en[-_]?IN/i.test(v.lang))
+    const vs = (Speech.voices && Speech.voices.length) ? Speech.voices : (window.speechSynthesis ? (window.speechSynthesis.getVoices()||[]) : []);
+    Speech.voices = vs;
+    // Prefer Punjabi → Hindi (closest) → any Indian voice → any voice at all.
+    return vs.find(v=>/pa[-_]?IN|punjab/i.test((v.lang||'')+(v.name||'')))
+        || vs.find(v=>/^pa/i.test(v.lang||''))
+        || vs.find(v=>/hi[-_]?IN/i.test(v.lang||''))
+        || vs.find(v=>/^hi/i.test(v.lang||''))
+        || vs.find(v=>/[-_]IN\b|india/i.test((v.lang||'')+(v.name||'')))
+        || vs.find(v=>/^en/i.test(v.lang||''))
+        || vs[0]
         || null;
   },
   speak(text, opts={}){
-    if(!('speechSynthesis' in window) || !text) return;
+    opts = opts || {};
+    if(Speech.unsupported || !('speechSynthesis' in window)){
+      if(Speech.warnCb && !Speech.noVoiceWarned){ Speech.noVoiceWarned = true; Speech.warnCb('Your browser does not support speech. Try Chrome, Edge or Safari.'); }
+      opts.onend && opts.onend();
+      return;
+    }
+    if(!text){ opts.onend && opts.onend(); return; }
     try{
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       const v = Speech.pick();
-      if(v){ u.voice = v; u.lang = v.lang; } else { u.lang = 'pa-IN'; }
-      u.rate = opts.rate ?? 0.82;
-      u.pitch = opts.pitch ?? 1.0;
-      if(opts.onend) u.onend = opts.onend;
+      if(v){ u.voice = v; u.lang = v.lang || 'hi-IN'; }
+      else {
+        // No voice object available yet — set a broad Indic lang and hope the OS routes it.
+        u.lang = 'hi-IN';
+        // If, after voices are known, there are simply none usable, warn once.
+        if(Speech.ready && (!Speech.voices || Speech.voices.length===0) && Speech.warnCb && !Speech.noVoiceWarned){
+          Speech.noVoiceWarned = true;
+          Speech.warnCb('No speech voice found on this device. On phones, install a Hindi/Punjabi voice in Settings → Accessibility → Text-to-Speech.');
+        }
+      }
+      u.rate = (opts.rate != null) ? opts.rate : 0.82;
+      u.pitch = (opts.pitch != null) ? opts.pitch : 1.0;
+      u.volume = 1;
+      let done = false;
+      const finish = ()=>{ if(done) return; done = true; opts.onend && opts.onend(); };
+      u.onend = finish;
+      u.onerror = finish;
       window.speechSynthesis.speak(u);
-    }catch(e){}
+      // Chrome sometimes needs a nudge to actually start.
+      try{ window.speechSynthesis.resume(); }catch(e){}
+      // Safety: clear the "speaking" UI even if no end event ever fires.
+      setTimeout(finish, Math.max(2500, text.length * 220));
+    }catch(e){ opts.onend && opts.onend(); }
   },
   stop(){ try{ window.speechSynthesis.cancel(); }catch(e){} }
 };
@@ -268,11 +304,16 @@ function Icon({name, size=22, color='currentColor', strokeWidth=2.2, className='
 /* ======================= SPEAK BUTTON ===================== */
 function Speak({text, label, sm, rate}){
   const [on,setOn]=useState(false);
-  const go=(e)=>{ e&&e.stopPropagation(); setOn(true); Speech.speak(text,{rate, onend:()=>setOn(false)}); setTimeout(()=>setOn(false),3000); };
+  const go=(e)=>{
+    e&&e.stopPropagation();
+    if(on){ Speech.stop(); setOn(false); return; }
+    setOn(true);
+    Speech.speak(text,{rate, onend:()=>setOn(false)});
+  };
   return (
-    <button className={'speak-btn '+(sm?'sm ':'')+(on?'speaking':'')} onClick={go}
+    <button type="button" className={'speak-btn '+(sm?'sm ':'')+(on?'speaking':'')} onClick={go}
       aria-label={'Listen'+(label?': '+label:'')} title="Listen">
-      <Icon name="volume-2" size={sm?16:18} color="#fff"/>
+      <Icon name={on?'volume-2':'volume-2'} size={sm?16:18} color="#fff"/>
     </button>
   );
 }
@@ -2635,7 +2676,10 @@ function App(){
     window.scrollTo({top:0,behavior:'smooth'});
   },[]);
 
-  const showToast=(msg)=>{ setToast(msg); clearTimeout(toastT.current); toastT.current=setTimeout(()=>setToast(''),2200); };
+  const showToast=useCallback((msg)=>{ setToast(msg); clearTimeout(toastT.current); toastT.current=setTimeout(()=>setToast(''),4500); },[]);
+
+  // Surface speech problems (no voice / unsupported) to the user as a toast
+  useEffect(()=>{ Speech.warnCb = showToast; return ()=>{ Speech.warnCb = null; }; },[showToast]);
 
   // ensure lucide icons render after tab swap
   useEffect(()=>{ const t=setTimeout(()=>{ try{ window.lucide&&window.lucide.createIcons(); }catch(e){} },120); return ()=>clearTimeout(t); },[active]);

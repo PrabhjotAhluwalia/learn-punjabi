@@ -256,16 +256,23 @@ const Speech = {
     }catch(e){}
   },
   pick(){
-    const vs = (Speech.voices && Speech.voices.length) ? Speech.voices : (window.speechSynthesis ? (window.speechSynthesis.getVoices()||[]) : []);
+    let vs = (Speech.voices && Speech.voices.length) ? Speech.voices : (window.speechSynthesis ? (window.speechSynthesis.getVoices()||[]) : []);
     Speech.voices = vs;
-    // Prefer Punjabi → Hindi (closest) → any Indian voice → any voice at all.
-    return vs.find(v=>/pa[-_]?IN|punjab/i.test((v.lang||'')+(v.name||'')))
-        || vs.find(v=>/^pa/i.test(v.lang||''))
-        || vs.find(v=>/hi[-_]?IN/i.test(v.lang||''))
-        || vs.find(v=>/^hi/i.test(v.lang||''))
-        || vs.find(v=>/[-_]IN\b|india/i.test((v.lang||'')+(v.name||'')))
-        || vs.find(v=>/^en/i.test(v.lang||''))
-        || vs[0]
+    // macOS ships many "novelty" voices (Bad News, Zarvox, Bells, Boing, Whisper, etc.)
+    // that sound horrific and must never be auto-selected. Filter them out for picking.
+    const NOVELTY = /^(bad news|good news|bahh|bells|boing|bubbles|cellos|jester|organ|superstar|trinoids|whisper|wobble|zarvox|albert|fred|junior|kathy|ralph|reed|rocko|sandy|shelley|grandma|grandpa|eddy|flo|beauregard)\b/i;
+    const clean = vs.filter(v=>!NOVELTY.test(v.name||''));
+    const pool = clean.length ? clean : vs;
+    // Prefer a real Punjabi voice, then Apple's Hindi (Lekha) as the closest match
+    // for Gurmukhi, then any Indian-language voice, then a normal English voice.
+    return pool.find(v=>/^pa\b|pa[-_]IN|punjab/i.test((v.lang||'')+' '+(v.name||'')))
+        || pool.find(v=>/^hi[-_]?IN$/i.test(v.lang||''))
+        || pool.find(v=>/lekha/i.test(v.name||''))
+        || pool.find(v=>/^hi/i.test(v.lang||''))
+        || pool.find(v=>/[-_]IN$/i.test(v.lang||''))
+        || pool.find(v=>/^en[-_]US$/i.test(v.lang||'') && /samantha/i.test(v.name||''))
+        || pool.find(v=>/^en/i.test(v.lang||''))
+        || pool[0]
         || null;
   },
   speak(text, opts={}){
